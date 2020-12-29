@@ -39,7 +39,9 @@ jobs:
 
     services:
       pulsar:
-        image: geal/pulsar-standalone:2.5.1
+        image: apachepulsar/pulsar:2.7.0
         ports:
-        - 6650:6650
-        - 8080:8080
+          - 6650:6650
+          - 8080:8080
+        options: "--entrypoint bin/pulsar standalone"
+
