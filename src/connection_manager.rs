@@ -2,10 +2,10 @@ use crate::connection::{Authentication, Connection};
 use crate::error::ConnectionError;
 use crate::executor::Executor;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::channel::oneshot;
+use futures::{channel::oneshot, lock::Mutex};
 use native_tls::Certificate;
 use rand::Rng;
 use url::Url;
@@ -24,31 +24,82 @@ pub struct BrokerAddress {
 
 /// configuration for reconnection exponential back off
 #[derive(Debug, Clone)]
-pub struct BackOffOptions {
+pub struct ConnectionRetryOptions {
+    /// minimum delay between connection retries
     pub min_backoff: Duration,
+    /// maximum delay between rconnection etries
     pub max_backoff: Duration,
+    /// maximum number of connection retries
     pub max_retries: u32,
+    /// time limit to establish a connection
+    pub connection_timeout: Duration,
+    /// keep-alive interval for each broker connection
+    pub keep_alive: Duration,
 }
 
-impl std::default::Default for BackOffOptions {
+impl std::default::Default for ConnectionRetryOptions {
     fn default() -> Self {
-        BackOffOptions {
+        ConnectionRetryOptions {
             min_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_secs(30),
             max_retries: 12u32,
+            connection_timeout: Duration::from_secs(10),
+            keep_alive: Duration::from_secs(60),
+        }
+    }
+}
+
+/// configuration for Pulsar operation retries
+#[derive(Debug, Clone)]
+pub struct OperationRetryOptions {
+    /// time limit to receive an answer to a Pulsar operation
+    pub operation_timeout: Duration,
+    /// delay between operation retries after a ServiceNotReady error
+    pub retry_delay: Duration,
+    /// maximum number of operation retries. None indicates infinite retries
+    pub max_retries: Option<u32>,
+}
+
+impl std::default::Default for OperationRetryOptions {
+    fn default() -> Self {
+        OperationRetryOptions {
+            operation_timeout: Duration::from_secs(30),
+            retry_delay: Duration::from_millis(500),
+            max_retries: None,
         }
     }
 }
 
 /// configuration for TLS connections
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TlsOptions {
+    /// contains a list of PEM encoded certificates
     pub certificate_chain: Option<Vec<u8>>,
+
+    /// allow insecure TLS connection if set to true
+    ///
+    /// defaults to *false*
+    pub allow_insecure_connection: bool,
+
+    /// whether hostname verification is enabled when insecure TLS connection is allowed
+    ///
+    /// defaults to *true*
+    pub tls_hostname_verification_enabled: bool,
 }
 
-enum ConnectionStatus {
-    Connected(Arc<Connection>),
-    Connecting(Vec<oneshot::Sender<Result<Arc<Connection>, ConnectionError>>>),
+impl Default for TlsOptions {
+    fn default() -> Self {
+        Self {
+            certificate_chain: None,
+            allow_insecure_connection: false,
+            tls_hostname_verification_enabled: true,
+        }
+    }
+}
+
+enum ConnectionStatus<Exe: Executor> {
+    Connected(Arc<Connection<Exe>>),
+    Connecting(Vec<oneshot::Sender<Result<Arc<Connection<Exe>>, ConnectionError>>>),
 }
 
 /// Look up broker addresses for topics and partitioned topics
@@ -61,8 +112,9 @@ pub struct ConnectionManager<Exe: Executor> {
     pub url: Url,
     auth: Option<Authentication>,
     pub(crate) executor: Arc<Exe>,
-    connections: Arc<Mutex<HashMap<BrokerAddress, ConnectionStatus>>>,
-    back_off_options: BackOffOptions,
+    connections: Arc<Mutex<HashMap<BrokerAddress, ConnectionStatus<Exe>>>>,
+    connection_retry_options: ConnectionRetryOptions,
+    pub(crate) operation_retry_options: OperationRetryOptions,
     tls_options: TlsOptions,
     certificate_chain: Vec<native_tls::Certificate>,
 }
@@ -71,11 +123,12 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     pub async fn new(
         url: String,
         auth: Option<Authentication>,
-        backoff: Option<BackOffOptions>,
+        connection_retry: Option<ConnectionRetryOptions>,
+        operation_retry_options: OperationRetryOptions,
         tls: Option<TlsOptions>,
         executor: Arc<Exe>,
     ) -> Result<Self, ConnectionError> {
-        let back_off_options = backoff.unwrap_or_default();
+        let connection_retry_options = connection_retry.unwrap_or_default();
         let tls_options = tls.unwrap_or_default();
         let url = Url::parse(&url)
             .map_err(|e| {
@@ -109,7 +162,8 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             auth,
             executor,
             connections: Arc::new(Mutex::new(HashMap::new())),
-            back_off_options,
+            connection_retry_options,
+            operation_retry_options,
             tls_options,
             certificate_chain,
         };
@@ -137,7 +191,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     /// get an active Connection from a broker address
     ///
     /// creates a connection if not available
-    pub async fn get_base_connection(&self) -> Result<Arc<Connection>, ConnectionError> {
+    pub async fn get_base_connection(&self) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         let broker_address = BrokerAddress {
             url: self.url.clone(),
             broker_url: format!(
@@ -157,13 +211,14 @@ impl<Exe: Executor> ConnectionManager<Exe> {
     pub async fn get_connection(
         &self,
         broker: &BrokerAddress,
-    ) -> Result<Arc<Connection>, ConnectionError> {
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         let rx = {
-            match self.connections.lock().unwrap().get_mut(broker) {
+            let mut conns = self.connections.lock().await;
+            match conns.get_mut(broker) {
                 None => None,
-                Some(ConnectionStatus::Connected(c)) => {
-                    if c.is_valid() {
-                        return Ok(c.clone());
+                Some(ConnectionStatus::Connected(conn)) => {
+                    if conn.is_valid() {
+                        return Ok(conn.clone());
                     } else {
                         None
                     }
@@ -185,14 +240,17 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         }
     }
 
-    async fn connect(&self, broker: BrokerAddress) -> Result<Arc<Connection>, ConnectionError> {
+    async fn connect_inner(
+        &self,
+        broker: &BrokerAddress,
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
         debug!("ConnectionManager::connect({:?})", broker);
 
         let rx = {
             match self
                 .connections
                 .lock()
-                .unwrap()
+                .await
                 .entry(broker.clone())
                 .or_insert_with(|| ConnectionStatus::Connecting(Vec::new()))
             {
@@ -231,25 +289,32 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 self.auth.clone(),
                 proxy_url.clone(),
                 &self.certificate_chain,
+                self.tls_options.allow_insecure_connection,
+                self.tls_options.tls_hostname_verification_enabled,
+                self.connection_retry_options.connection_timeout,
+                self.operation_retry_options.operation_timeout,
                 self.executor.clone(),
             )
             .await
             {
                 Ok(c) => break c,
                 Err(ConnectionError::Io(e)) => {
-                    if e.kind() != std::io::ErrorKind::ConnectionRefused {
+                    if e.kind() != std::io::ErrorKind::ConnectionRefused
+                        || e.kind() != std::io::ErrorKind::TimedOut
+                    {
                         return Err(ConnectionError::Io(e));
                     }
 
-                    if current_retries == self.back_off_options.max_retries {
+                    if current_retries == self.connection_retry_options.max_retries {
                         return Err(ConnectionError::Io(e));
                     }
 
-                    let jitter = rand::thread_rng().gen_range(0, 10);
+                    let jitter = rand::thread_rng().gen_range(0..10);
                     current_backoff = std::cmp::min(
-                        self.back_off_options.min_backoff * 2u32.saturating_pow(current_retries),
-                        self.back_off_options.max_backoff,
-                    ) + self.back_off_options.min_backoff * jitter;
+                        self.connection_retry_options.min_backoff
+                            * 2u32.saturating_pow(current_retries),
+                        self.connection_retry_options.max_backoff,
+                    ) + self.connection_retry_options.min_backoff * jitter;
                     current_retries += 1;
 
                     trace!(
@@ -268,16 +333,105 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 Err(e) => return Err(e),
             }
         };
-        info!(
-            "Connected to {} in {}ms",
-            broker.url,
-            (std::time::Instant::now() - start).as_millis()
-        );
+        let connection_id = conn.id();
+        if let Some(url) = proxy_url.as_ref() {
+            info!(
+                "Connected n°{} to {} via proxy {} in {}ms",
+                connection_id,
+                url,
+                broker.url,
+                (std::time::Instant::now() - start).as_millis()
+            );
+        } else {
+            info!(
+                "Connected n°{} to {} in {}ms",
+                connection_id,
+                broker.url,
+                (std::time::Instant::now() - start).as_millis()
+            );
+        }
         let c = Arc::new(conn);
+
+        Ok(c)
+    }
+
+    async fn connect(
+        &self,
+        broker: BrokerAddress,
+    ) -> Result<Arc<Connection<Exe>>, ConnectionError> {
+        let c = match self.connect_inner(&broker).await {
+            Err(e) => {
+                // the current ConnectionStatus is Connecting, containing
+                // notification channels for all the tasks waiting for the
+                // reconnection. If we delete this status, they will be
+                // notified that reconnection is canceled instead of getting
+                // stuck
+                if let Some(ConnectionStatus::Connecting(mut v)) =
+                    self.connections.lock().await.remove(&broker)
+                {
+                    for tx in v.drain(..) {
+                        // we cannot clone ConnectionError so we tell other
+                        // tasks that reconnection is canceled
+                        let _ = tx.send(Err(ConnectionError::Canceled));
+                    }
+                }
+
+                return Err(e);
+            }
+            Ok(c) => c,
+        };
+
+        let connection_id = c.id();
+        let proxy_url = if broker.proxy {
+            Some(broker.broker_url.clone())
+        } else {
+            None
+        };
+
+        // set up client heartbeats for the connection
+        let weak_conn = Arc::downgrade(&c);
+        let mut interval = self
+            .executor
+            .interval(self.connection_retry_options.keep_alive);
+        let broker_url = broker.url.clone();
+        let proxy_to_broker_url = proxy_url.clone();
+        let res = self.executor.spawn(Box::pin(async move {
+            use crate::futures::StreamExt;
+            while let Some(()) = interval.next().await {
+                if let Some(url) = proxy_to_broker_url.as_ref() {
+                    trace!(
+                        "will ping connection {} to {} via proxy {}",
+                        connection_id,
+                        url,
+                        broker_url
+                    );
+                } else {
+                    trace!("will ping connection {} to {}", connection_id, broker_url);
+                }
+                if let Some(strong_conn) = weak_conn.upgrade() {
+                    if let Err(e) = strong_conn.sender().send_ping().await {
+                        error!(
+                            "could not ping connection {} to the server at {}: {}",
+                            connection_id, broker_url, e
+                        );
+                    }
+                } else {
+                    // if the strong pointers were dropped, we can stop the heartbeat for this
+                    // connection
+                    trace!("strong connection was dropped, stopping keepalive task");
+                    break;
+                }
+            }
+        }));
+        if res.is_err() {
+            error!("the executor could not spawn the heartbeat future");
+            return Err(ConnectionError::Shutdown);
+        }
+
         let old = self
             .connections
             .lock()
-            .unwrap()
+            .await
             .insert(broker, ConnectionStatus::Connected(c.clone()));
         match old {
             Some(ConnectionStatus::Connecting(mut v)) => {
@@ -295,5 +449,25 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         };
 
         Ok(c)
+    }
+
+    /// tests that all connections are valid and still used
+    pub(crate) async fn check_connections(&self) {
+        trace!("cleaning invalid or unused connections");
+        self.connections
+            .lock()
+            .await
+            .retain(|_, ref mut connection| match connection {
+                ConnectionStatus::Connecting(_) => true,
+                ConnectionStatus::Connected(conn) => {
+                    // if the manager holds the only reference to that
+                    // connection, we can remove it from the manager
+                    // no need for special synchronization here: we're already
+                    // in a mutex, and a case appears where the Arc is cloned
+                    // somewhere at the same time, that just means the manager
+                    // will create a new connection the next time it is asked
+                    conn.is_valid() && Arc::strong_count(conn) > 1
+                }
+            });
     }
 }

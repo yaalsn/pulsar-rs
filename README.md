@@ -20,9 +20,10 @@ Features:
 Cargo.toml
 ```toml
 futures = "0.3"
-pulsar = "1.0"
-tokio = "0.2"
+pulsar = "4.0"
+tokio = "1.0"
 ```
+
 #### Producing
 ```rust
 use serde::{Serialize, Deserialize};
@@ -75,7 +76,7 @@ async fn main() -> Result<(), pulsar::Error> {
 
         counter += 1;
         println!("{} messages", counter);
-        tokio::time::delay_for(std::time::Duration::from_millis(2000)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     }
 }
 ```

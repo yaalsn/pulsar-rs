@@ -1,9 +1,10 @@
 //! Message publication
-use futures::channel::oneshot;
-use futures::future::try_join_all;
+use futures::{channel::oneshot, future::try_join_all, lock::Mutex};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::client::SerializeMessage;
 use crate::connection::{Connection, SerialId};
@@ -14,11 +15,15 @@ use crate::message::BatchedMessage;
 use crate::{Error, Pulsar};
 use futures::task::{Context, Poll};
 use futures::Future;
-use tokio::macros::support::Pin;
 
 type ProducerId = u64;
 type ProducerName = String;
 
+/// returned by [Producer::send]
+///
+/// it contains a channel on which we can await to get the message receipt.
+/// Depending on the producer's configuration (batching, flow control, etc)and
+/// the server's load, the send receipt could come much later after sending it
 pub struct SendFuture(pub(crate) oneshot::Receiver<Result<CommandSendReceipt, Error>>);
 
 impl Future for SendFuture {
@@ -46,14 +51,16 @@ impl Future for SendFuture {
 pub struct Message {
     /// serialized data
     pub payload: Vec<u8>,
+    /// user defined properties
     pub properties: HashMap<String, String>,
-    /// key to decide partition for the msg
+    /// key to decide partition for the message
     pub partition_key: ::std::option::Option<String>,
     /// Override namespace's replication
     pub replicate_to: ::std::vec::Vec<String>,
     /// the timestamp that this event occurs. it is typically set by applications.
     /// if this field is omitted, `publish_time` can be used for the purpose of `event_time`.
     pub event_time: ::std::option::Option<u64>,
+    /// current version of the schema
     pub schema_version: ::std::option::Option<Vec<u8>>,
 }
 
@@ -82,6 +89,9 @@ pub(crate) struct ProducerMessage {
     /// Additional parameters required by encryption
     pub encryption_param: ::std::option::Option<Vec<u8>>,
     pub schema_version: ::std::option::Option<Vec<u8>>,
+    /// UTC Unix timestamp in milliseconds, time at which the message should be
+    /// delivered to consumers
+    pub deliver_at_time: ::std::option::Option<i64>,
 }
 
 impl From<Message> for ProducerMessage {
@@ -101,10 +111,15 @@ impl From<Message> for ProducerMessage {
 /// Configuration options for producers
 #[derive(Clone, Default)]
 pub struct ProducerOptions {
+    /// end to end message encryption (not implemented yet)
     pub encrypted: Option<bool>,
+    /// user defined properties added to all messages
     pub metadata: BTreeMap<String, String>,
+    /// schema used to encode this producer's messages
     pub schema: Option<Schema>,
+    /// batch message size
     pub batch_size: Option<u32>,
+    /// algorithm used to compress the messages
     pub compression: Option<proto::CompressionType>,
 }
 
@@ -135,14 +150,17 @@ pub struct MultiTopicProducer<Exe: Executor> {
 }
 
 impl<Exe: Executor> MultiTopicProducer<Exe> {
+    /// producer options
     pub fn options(&self) -> &ProducerOptions {
         &self.options
     }
 
+    /// list topics currently handled by this producer
     pub fn topics(&self) -> Vec<String> {
         self.producers.keys().cloned().collect()
     }
 
+    /// stops the producer
     pub async fn close_producer<S: Into<String>>(&mut self, topic: S) -> Result<(), Error> {
         let partitions = self.client.lookup_partitioned_topic(topic).await?;
         for (topic, _) in partitions {
@@ -151,6 +169,7 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
         Ok(())
     }
 
+    /// sends one message on a topic
     pub async fn send<T: SerializeMessage + Sized, S: Into<String>>(
         &mut self,
         topic: S,
@@ -167,9 +186,7 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
             if let Some(name) = &self.name {
                 builder = builder.with_name(name.clone());
             }
-            let producer = builder
-                .build()
-                .await?;
+            let producer = builder.build().await?;
             self.producers.insert(topic.clone(), producer);
         }
 
@@ -177,6 +194,7 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
         producer.send(message).await
     }
 
+    /// sends a list of messages on a topic
     pub async fn send_all<'a, 'b, T, S, I>(
         &mut self,
         topic: S,
@@ -203,15 +221,18 @@ impl<Exe: Executor> MultiTopicProducer<Exe> {
     }
 }
 
+/// a producer for a single topic
 pub struct Producer<Exe: Executor> {
     inner: ProducerInner<Exe>,
 }
 
 impl<Exe: Executor> Producer<Exe> {
+    /// creates a producer builder from a client instance
     pub fn builder(pulsar: &Pulsar<Exe>) -> ProducerBuilder<Exe> {
-        ProducerBuilder::new(&pulsar)
+        ProducerBuilder::new(pulsar)
     }
 
+    /// this producer's topic
     pub fn topic(&self) -> &str {
         match &self.inner {
             ProducerInner::Single(p) => p.topic(),
@@ -219,19 +240,17 @@ impl<Exe: Executor> Producer<Exe> {
         }
     }
 
+    /// list of partitions for this producer's topic
     pub fn partitions(&self) -> Option<Vec<String>> {
         match &self.inner {
             ProducerInner::Single(_) => None,
             ProducerInner::Partitioned(p) => {
-                Some(
-                    p.producers.iter()
-                        .map(|p| p.topic().to_owned())
-                        .collect()
-                )
+                Some(p.producers.iter().map(|p| p.topic().to_owned()).collect())
             }
         }
     }
 
+    /// configuration options
     pub fn options(&self) -> &ProducerOptions {
         match &self.inner {
             ProducerInner::Single(p) => p.options(),
@@ -239,10 +258,14 @@ impl<Exe: Executor> Producer<Exe> {
         }
     }
 
+    /// creates a message builder
+    ///
+    /// the created message will ber sent by this producer in [MessageBuilder::send]
     pub fn create_message(&mut self) -> MessageBuilder<(), Exe> {
         MessageBuilder::new(self)
     }
 
+    /// test that the broker connections are still valid
     pub async fn check_connection(&self) -> Result<(), Error> {
         match &self.inner {
             ProducerInner::Single(p) => p.check_connection().await,
@@ -283,6 +306,7 @@ impl<Exe: Executor> Producer<Exe> {
         }
     }
 
+    /// sends a list of messages
     pub async fn send_all<T, I>(&mut self, messages: I) -> Result<Vec<SendFuture>, Error>
     where
         T: SerializeMessage,
@@ -345,7 +369,7 @@ impl<Exe: Executor> PartitionedProducer<Exe> {
 /// a producer is used to publish messages on a topic
 struct TopicProducer<Exe: Executor> {
     client: Pulsar<Exe>,
-    connection: Arc<Connection>,
+    connection: Arc<Connection<Exe>>,
     id: ProducerId,
     name: ProducerName,
     topic: String,
@@ -361,7 +385,7 @@ struct TopicProducer<Exe: Executor> {
 impl<Exe: Executor> TopicProducer<Exe> {
     pub(crate) async fn from_connection<S: Into<String>>(
         client: Pulsar<Exe>,
-        connection: Arc<Connection>,
+        mut connection: Arc<Connection<Exe>>,
         topic: S,
         name: Option<String>,
         options: ProducerOptions,
@@ -369,11 +393,6 @@ impl<Exe: Executor> TopicProducer<Exe> {
         let topic = topic.into();
         let producer_id = rand::random();
         let sequence_ids = SerialId::new();
-
-        let _ = connection
-            .sender()
-            .lookup_topic(topic.clone(), false)
-            .await?;
 
         let topic = topic.clone();
         let batch_size = options.batch_size;
@@ -399,10 +418,68 @@ impl<Exe: Executor> TopicProducer<Exe> {
             } //Some() => unimplemented!(),
         };
 
-        let success = connection
-            .sender()
-            .create_producer(topic.clone(), producer_id, name, options.clone())
-            .await?;
+        let producer_name: ProducerName;
+        let mut current_retries = 0u32;
+        let start = std::time::Instant::now();
+        let operation_retry_options = client.operation_retry_options.clone();
+
+        loop {
+            match connection
+                .sender()
+                .create_producer(topic.clone(), producer_id, name.clone(), options.clone())
+                .await
+                .map_err(|e| {
+                    error!("TopicProducer::from_connection error[{}]: {:?}", line!(), e);
+                    e
+                }) {
+                Ok(success) => {
+                    producer_name = success.producer_name;
+
+                    if current_retries > 0 {
+                        let dur = (std::time::Instant::now() - start).as_secs();
+                        log::info!(
+                            "subscribe({}) success after {} retries over {} seconds",
+                            topic,
+                            current_retries + 1,
+                            dur
+                        );
+                    }
+                    break;
+                }
+                Err(ConnectionError::PulsarError(
+                    Some(proto::ServerError::ServiceNotReady),
+                    text,
+                )) => {
+                    if operation_retry_options.max_retries.is_none()
+                        || operation_retry_options.max_retries.unwrap() > current_retries
+                    {
+                        error!("create_producer({}) answered ServiceNotReady, retrying request after {}ms (max_retries = {:?}): {}",
+                        topic, operation_retry_options.retry_delay.as_millis(),
+                        operation_retry_options.max_retries, text.unwrap_or_else(String::new));
+
+                        current_retries += 1;
+                        client
+                            .executor
+                            .delay(operation_retry_options.retry_delay)
+                            .await;
+
+                        let addr = client.lookup_topic(&topic).await?;
+                        connection = client.manager.get_connection(&addr).await?;
+
+                        continue;
+                    } else {
+                        error!("create_producer({}) reached max retries", topic);
+
+                        return Err(ConnectionError::PulsarError(
+                            Some(proto::ServerError::ServiceNotReady),
+                            text,
+                        )
+                        .into());
+                    }
+                }
+                Err(e) => return Err(Error::Connection(e)),
+            }
+        }
 
         // drop_signal will be dropped when the TopicProducer is dropped, then
         // drop_receiver will return, and we can close the producer
@@ -417,7 +494,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
             client,
             connection,
             id: producer_id,
-            name: success.producer_name,
+            name: producer_name,
             topic,
             message_id: sequence_ids,
             batch: batch_size.map(Batch::new).map(Mutex::new),
@@ -427,30 +504,27 @@ impl<Exe: Executor> TopicProducer<Exe> {
         })
     }
 
-    pub fn topic(&self) -> &str {
+    fn topic(&self) -> &str {
         &self.topic
     }
 
-    pub fn options(&self) -> &ProducerOptions {
+    fn options(&self) -> &ProducerOptions {
         &self.options
     }
 
-    pub async fn check_connection(&self) -> Result<(), Error> {
+    async fn check_connection(&self) -> Result<(), Error> {
         self.connection.sender().send_ping().await?;
         Ok(())
     }
 
-    pub async fn send<T: SerializeMessage + Sized>(
-        &mut self,
-        message: T,
-    ) -> Result<SendFuture, Error> {
+    async fn send<T: SerializeMessage + Sized>(&mut self, message: T) -> Result<SendFuture, Error> {
         match T::serialize_message(message) {
             Ok(message) => self.send_raw(message.into()).await,
             Err(e) => Err(e),
         }
     }
 
-    pub async fn send_batch(&mut self) -> Result<(), Error> {
+    async fn send_batch(&mut self) -> Result<(), Error> {
         match self.batch.as_ref() {
             None => Err(ProducerError::Custom("not a batching producer".to_string()).into()),
             Some(batch) => {
@@ -459,8 +533,8 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 let message_count;
 
                 {
-                    let batch = batch.lock().unwrap();
-                    let messages = batch.get_messages();
+                    let batch = batch.lock().await;
+                    let messages = batch.get_messages().await;
                     message_count = messages.len();
                     for (tx, message) in messages {
                         receipts.push(tx);
@@ -479,7 +553,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 };
 
                 trace!("sending a batched message of size {}", message_count);
-                let send_receipt = self.send_compress(message).await.map_err(|e| Arc::new(e));
+                let send_receipt = self.send_compress(message).await.map_err(Arc::new);
                 for resolver in receipts {
                     let _ = resolver.send(
                         send_receipt
@@ -507,11 +581,11 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 let mut counter = 0i32;
 
                 {
-                    let batch = batch.lock().unwrap();
-                    batch.push_back((tx, message));
+                    let batch = batch.lock().await;
+                    batch.push_back((tx, message)).await;
 
-                    if batch.is_full() {
-                        for (tx, message) in batch.get_messages() {
+                    if batch.is_full().await {
+                        for (tx, message) in batch.get_messages().await {
                             receipts.push(tx);
                             message.serialize(&mut payload);
                             counter += 1;
@@ -526,7 +600,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
                         ..Default::default()
                     };
 
-                    let send_receipt = self.send_compress(message).await.map_err(|e| Arc::new(e));
+                    let send_receipt = self.send_compress(message).await.map_err(Arc::new);
 
                     trace!("sending a batched message of size {}", counter);
                     for tx in receipts.drain(..) {
@@ -555,16 +629,11 @@ impl<Exe: Executor> TopicProducer<Exe> {
 
                 #[cfg(feature = "lz4")]
                 {
-                    let v: Vec<u8> = Vec::new();
-                    let mut encoder = lz4::EncoderBuilder::new()
-                        .build(v)
-                        .map_err(ProducerError::Io)?;
-                    encoder
-                        .write(&message.payload[..])
-                        .map_err(ProducerError::Io)?;
-                    let (compressed_payload, result) = encoder.finish();
+                    let compressed_payload: Vec<u8> =
+                        lz4::block::compress(&message.payload[..], None, false)
+                            .map_err(ProducerError::Io)?;
 
-                    result.map_err(ProducerError::Io)?;
+                    message.uncompressed_size = Some(message.payload.len() as u32);
                     message.payload = compressed_payload;
                     message.compression = Some(1);
                     message
@@ -645,13 +714,22 @@ impl<Exe: Executor> TopicProducer<Exe> {
         {
             Ok(receipt) => return Ok(receipt),
             Err(ConnectionError::Disconnected) => {}
+            Err(ConnectionError::Io(e)) => {
+                if e.kind() != std::io::ErrorKind::TimedOut {
+                    error!("send_inner got io error: {:?}", e);
+                    return Err(ProducerError::Connection(ConnectionError::Io(e)).into());
+                }
+            }
             Err(e) => {
                 error!("send_inner got error: {:?}", e);
                 return Err(ProducerError::Connection(e).into());
             }
         };
 
-        error!("send_inner disconnected");
+        error!(
+            "send_inner: connection {} disconnected",
+            self.connection.id()
+        );
         self.reconnect().await?;
 
         match self
@@ -678,16 +756,71 @@ impl<Exe: Executor> TopicProducer<Exe> {
         let topic = self.topic.clone();
         let batch_size = self.options.batch_size;
 
-        let _ = self
-            .connection
-            .sender()
-            .create_producer(
-                topic.clone(),
-                self.id,
-                Some(self.name.clone()),
-                self.options.clone(),
-            )
-            .await?;
+        let mut current_retries = 0u32;
+        let start = std::time::Instant::now();
+        let operation_retry_options = self.client.operation_retry_options.clone();
+
+        loop {
+            match self
+                .connection
+                .sender()
+                .create_producer(
+                    topic.clone(),
+                    self.id,
+                    Some(self.name.clone()),
+                    self.options.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("TopicProducer::from_connection error[{}]: {:?}", line!(), e);
+                    e
+                }) {
+                Ok(_success) => {
+                    if current_retries > 0 {
+                        let dur = (std::time::Instant::now() - start).as_secs();
+                        log::info!(
+                            "subscribe({}) success after {} retries over {} seconds",
+                            topic,
+                            current_retries + 1,
+                            dur
+                        );
+                    }
+                    break;
+                }
+                Err(ConnectionError::PulsarError(
+                    Some(proto::ServerError::ServiceNotReady),
+                    text,
+                )) => {
+                    if operation_retry_options.max_retries.is_none()
+                        || operation_retry_options.max_retries.unwrap() > current_retries
+                    {
+                        error!("create_producer({}) answered ServiceNotReady, retrying request after {}ms (max_retries = {:?}): {}",
+                        topic, operation_retry_options.retry_delay.as_millis(),
+                        operation_retry_options.max_retries, text.unwrap_or_else(String::new));
+
+                        current_retries += 1;
+                        self.client
+                            .executor
+                            .delay(operation_retry_options.retry_delay)
+                            .await;
+
+                        let addr = self.client.lookup_topic(&topic).await?;
+                        self.connection = self.client.manager.get_connection(&addr).await?;
+
+                        continue;
+                    } else {
+                        error!("create_producer({}) reached max retries", topic);
+
+                        return Err(ConnectionError::PulsarError(
+                            Some(proto::ServerError::ServiceNotReady),
+                            text,
+                        )
+                        .into());
+                    }
+                }
+                Err(e) => return Err(Error::Connection(e)),
+            }
+        }
 
         // drop_signal will be dropped when the TopicProducer is dropped, then
         // drop_receiver will return, and we can close the producer
@@ -719,6 +852,7 @@ pub struct ProducerBuilder<Exe: Executor> {
 }
 
 impl<Exe: Executor> ProducerBuilder<Exe> {
+    /// creates a new ProducerBuilder from a client
     pub fn new(pulsar: &Pulsar<Exe>) -> Self {
         ProducerBuilder {
             pulsar: pulsar.clone(),
@@ -728,21 +862,25 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
         }
     }
 
+    /// sets the producer's topic
     pub fn with_topic<S: Into<String>>(mut self, topic: S) -> Self {
         self.topic = Some(topic.into());
         self
     }
 
+    /// sets the producer's name
     pub fn with_name<S: Into<String>>(mut self, name: S) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// configuration options
     pub fn with_options(mut self, options: ProducerOptions) -> Self {
         self.producer_options = Some(options);
         self
     }
 
+    /// creates a new producer
     pub async fn build(self) -> Result<Producer<Exe>, Error> {
         let ProducerBuilder {
             pulsar,
@@ -750,7 +888,7 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             name,
             producer_options,
         } = self;
-        let topic = topic.ok_or(Error::Custom(format!("topic not set")))?;
+        let topic = topic.ok_or_else(|| Error::Custom("topic not set".to_string()))?;
         let options = producer_options.unwrap_or_default();
 
         let producers: Vec<TopicProducer<Exe>> = try_join_all(
@@ -771,28 +909,32 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
                     }
                 }),
         )
-            .await?;
+        .await?;
 
-        let producer = if producers.len() == 1 {
-            ProducerInner::Single(producers.into_iter().next().unwrap())
-        } else if producers.len() > 1 {
-            let mut producers = VecDeque::from(producers);
-            // write to topic-1 first
-            producers.rotate_right(1);
-            ProducerInner::Partitioned(PartitionedProducer {
-                producers,
-                topic,
-                options,
-            })
-        } else {
-            return Err(Error::Custom(format!(
-                "Unexpected error: Partition lookup returned no topics for {}",
-                topic
-            )));
+        let producer = match producers.len() {
+            0 => {
+                return Err(Error::Custom(format!(
+                    "Unexpected error: Partition lookup returned no topics for {}",
+                    topic
+                )))
+            }
+            1 => ProducerInner::Single(producers.into_iter().next().unwrap()),
+            _ => {
+                let mut producers = VecDeque::from(producers);
+                // write to topic-1 first
+                producers.rotate_right(1);
+                ProducerInner::Partitioned(PartitionedProducer {
+                    producers,
+                    topic,
+                    options,
+                })
+            }
         };
+
         Ok(Producer { inner: producer })
     }
 
+    /// creates a new [MultiTopicProducer]
     pub fn build_multi_topic(self) -> MultiTopicProducer<Exe> {
         MultiTopicProducer {
             client: self.pulsar,
@@ -807,6 +949,7 @@ struct Batch {
     pub length: u32,
     // put it in a mutex because the design of Producer requires an immutable TopicProducer,
     // so we cannot have a mutable Batch in a send_raw(&mut self, ...)
+    #[allow(clippy::type_complexity)]
     pub storage: Mutex<
         VecDeque<(
             oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
@@ -823,11 +966,11 @@ impl Batch {
         }
     }
 
-    pub fn is_full(&self) -> bool {
-        self.storage.lock().unwrap().len() >= self.length as usize
+    pub async fn is_full(&self) -> bool {
+        self.storage.lock().await.len() >= self.length as usize
     }
 
-    pub fn push_back(
+    pub async fn push_back(
         &self,
         msg: (
             oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
@@ -851,16 +994,16 @@ impl Batch {
             },
             payload: message.payload,
         };
-        self.storage.lock().unwrap().push_back((tx, batched))
+        self.storage.lock().await.push_back((tx, batched))
     }
 
-    pub fn get_messages(
+    pub async fn get_messages(
         &self,
     ) -> Vec<(
         oneshot::Sender<Result<proto::CommandSendReceipt, Error>>,
         BatchedMessage,
     )> {
-        self.storage.lock().unwrap().drain(..).collect()
+        self.storage.lock().await.drain(..).collect()
     }
 }
 
@@ -871,53 +1014,92 @@ pub struct MessageBuilder<'a, T, Exe: Executor> {
     producer: &'a mut Producer<Exe>,
     properties: HashMap<String, String>,
     partition_key: Option<String>,
+    deliver_at_time: Option<i64>,
     content: T,
 }
 
 impl<'a, Exe: Executor> MessageBuilder<'a, (), Exe> {
+    /// creates a message builder from an existing producer
     pub fn new(producer: &'a mut Producer<Exe>) -> Self {
         MessageBuilder {
             producer,
             properties: HashMap::new(),
             partition_key: None,
+            deliver_at_time: None,
             content: (),
         }
     }
 }
 
 impl<'a, T, Exe: Executor> MessageBuilder<'a, T, Exe> {
+    /// sets the message's content
     pub fn with_content<C>(self, content: C) -> MessageBuilder<'a, C, Exe> {
         MessageBuilder {
             producer: self.producer,
             properties: self.properties,
             partition_key: self.partition_key,
+            deliver_at_time: self.deliver_at_time,
             content,
         }
     }
 
+    /// sets the message's partition key
     pub fn with_partition_key<S: Into<String>>(mut self, partition_key: S) -> Self {
         self.partition_key = Some(partition_key.into());
         self
     }
 
+    /// sets the message's partition key
+    ///
+    /// this is the same as `with_partition_key`, this method is added for
+    /// more consistency with other clients
+    pub fn with_key<S: Into<String>>(mut self, partition_key: S) -> Self {
+        self.partition_key = Some(partition_key.into());
+        self
+    }
+
+    /// sets a user defined property
     pub fn with_property<S1: Into<String>, S2: Into<String>>(mut self, key: S1, value: S2) -> Self {
         self.properties.insert(key.into(), value.into());
         self
     }
+
+    /// delivers the message at this date
+    pub fn deliver_at(mut self, date: SystemTime) -> Result<Self, std::time::SystemTimeError> {
+        self.deliver_at_time = Some(date.duration_since(UNIX_EPOCH)?.as_millis() as i64);
+        Ok(self)
+    }
+
+    /// delays message deliver with this duration
+    pub fn delay(mut self, delay: Duration) -> Result<Self, std::time::SystemTimeError> {
+        let date = SystemTime::now() + delay;
+        println!(
+            "current date: {}, deliver_at: {}",
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            date.duration_since(UNIX_EPOCH)?.as_millis()
+        );
+        self.deliver_at_time = Some(date.duration_since(UNIX_EPOCH)?.as_millis() as i64);
+        Ok(self)
+    }
 }
 
 impl<'a, T: SerializeMessage + Sized, Exe: Executor> MessageBuilder<'a, T, Exe> {
+    /// sends the message through the producer that created it
     pub async fn send(self) -> Result<SendFuture, Error> {
         let MessageBuilder {
             producer,
             properties,
             partition_key,
             content,
+            deliver_at_time,
         } = self;
 
         let mut message = T::serialize_message(content)?;
         message.properties = properties;
         message.partition_key = partition_key;
-        producer.send_raw(message.into()).await
+
+        let mut producer_message: ProducerMessage = message.into();
+        producer_message.deliver_at_time = deliver_at_time;
+        producer.send_raw(producer_message).await
     }
 }

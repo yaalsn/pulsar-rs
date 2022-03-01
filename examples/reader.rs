@@ -2,7 +2,8 @@
 extern crate serde;
 use futures::TryStreamExt;
 use pulsar::{
-    Authentication, Consumer, DeserializeMessage, Payload, Pulsar, SubType, TokioExecutor,
+    consumer::ConsumerOptions, proto::Schema, reader::Reader, Authentication, DeserializeMessage,
+    Payload, Pulsar, TokioExecutor,
 };
 use std::env;
 
@@ -18,7 +19,6 @@ impl DeserializeMessage for TestData {
         serde_json::from_slice(&payload.data)
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<(), pulsar::Error> {
     env_logger::init();
@@ -43,24 +43,30 @@ async fn main() -> Result<(), pulsar::Error> {
 
     let pulsar: Pulsar<_> = builder.build().await?;
 
-    let mut consumer: Consumer<TestData, _> = pulsar
-        .consumer()
+    let mut reader: Reader<TestData, _> = pulsar
+        .reader()
         .with_topic(topic)
-        .with_consumer_name("test_consumer")
-        .with_subscription_type(SubType::Exclusive)
-        .with_subscription("test_subscription")
-        .build()
+        .with_consumer_name("test_reader")
+        .with_options(ConsumerOptions::default().with_schema(Schema {
+            r#type: pulsar::proto::schema::Type::String as i32,
+            ..Default::default()
+        }))
+        // subscription defaults to SubType::Exclusive
+        .into_reader()
         .await?;
+    // log::info!("created a reader");
 
     let mut counter = 0usize;
-    while let Some(msg) = consumer.try_next().await? {
-        consumer.ack(&msg).await?;
-        log::info!("metadata: {:?}", msg.metadata());
+
+    // listen to 5 messages
+    while let Some(msg) = reader.try_next().await? {
+        log::info!("metadata: {:#?}", msg.metadata());
+
         log::info!("id: {:?}", msg.message_id());
         let data = match msg.deserialize() {
             Ok(data) => data,
             Err(e) => {
-                log::error!("could not deserialize message: {:?}", e);
+                log::error!("Could not deserialize message: {:?}", e);
                 break;
             }
         };
@@ -70,6 +76,10 @@ async fn main() -> Result<(), pulsar::Error> {
             break;
         }
         counter += 1;
+
+        if counter > 5 {
+            break;
+        }
         log::info!("got {} messages", counter);
     }
 

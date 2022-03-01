@@ -41,7 +41,7 @@ async fn main() -> Result<(), pulsar::Error> {
         .with_name("my-producer")
         .with_options(producer::ProducerOptions {
             schema: Some(proto::Schema {
-                type_: proto::schema::Type::String as i32,
+                r#type: proto::schema::Type::String as i32,
                 ..Default::default()
             }),
             ..Default::default()
@@ -80,6 +80,7 @@ async fn main() -> Result<(), pulsar::Error> {
 
     let mut counter = 0usize;
     while let Some(msg) = consumer.try_next().await? {
+        log::info!("id: {:?}", msg.message_id());
         consumer.ack(&msg).await?;
         let data = msg.deserialize().unwrap();
         if data.data.as_str() != "data" {

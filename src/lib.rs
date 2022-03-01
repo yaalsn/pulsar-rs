@@ -15,13 +15,25 @@
 //!
 //! ## Examples
 //!
+//! Copy this into your project's Cargo.toml:
+//!
+//! ```toml
+//! [dependencies]
+//! env_logger = "0.9"
+//! pulsar = "4.1.1"
+//! serde = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
+//! tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+//! log = "0.4.6"
+//! futures = "0.3"
+//! ```
+//!
 //! ### Producing
 //! ```rust,no_run
-//! #[macro_use]
-//! extern crate serde;
 //! use pulsar::{
 //!     message::proto, producer, Error as PulsarError, Pulsar, SerializeMessage, TokioExecutor,
 //! };
+//! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct TestData {
@@ -50,7 +62,7 @@
 //!         .with_name("my producer")
 //!         .with_options(producer::ProducerOptions {
 //!             schema: Some(proto::Schema {
-//!                 type_: proto::schema::Type::String as i32,
+//!                 r#type: proto::schema::Type::String as i32,
 //!                 ..Default::default()
 //!             }),
 //!             ..Default::default()
@@ -68,20 +80,19 @@
 //!
 //!         counter += 1;
 //!         println!("{} messages", counter);
-//!         tokio::time::delay_for(std::time::Duration::from_millis(2000)).await;
+//!         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 //!     }
 //! }
 //! ```
 //!
 //! ### Consuming
 //! ```rust,no_run
-//! #[macro_use]
-//! extern crate serde;
 //! use futures::TryStreamExt;
 //! use pulsar::{
 //!     message::proto::command_subscribe::SubType, message::Payload, Consumer, DeserializeMessage,
 //!     Pulsar, TokioExecutor,
 //! };
+//! use serde::{Deserialize, Serialize};
 //!
 //! #[derive(Serialize, Deserialize)]
 //! struct TestData {
@@ -134,22 +145,23 @@
 //!     Ok(())
 //! }
 //! ```
-
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::large_enum_variant)]
 extern crate futures;
 #[macro_use]
 extern crate log;
-#[macro_use]
 extern crate nom;
-#[macro_use]
 extern crate prost_derive;
 
 #[cfg(test)]
 #[macro_use]
 extern crate serde;
 
-pub use client::{Pulsar, PulsarBuilder, DeserializeMessage, SerializeMessage};
+pub use client::{DeserializeMessage, Pulsar, PulsarBuilder, SerializeMessage};
 pub use connection::Authentication;
-pub use connection_manager::{BackOffOptions, BrokerAddress, TlsOptions};
+pub use connection_manager::{
+    BrokerAddress, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
+};
 pub use consumer::{Consumer, ConsumerBuilder, ConsumerOptions};
 pub use error::Error;
 #[cfg(feature = "async-std-runtime")]
@@ -158,8 +170,11 @@ pub use executor::Executor;
 #[cfg(feature = "tokio-runtime")]
 pub use executor::TokioExecutor;
 pub use message::proto::command_subscribe::SubType;
+pub use message::{
+    proto::{self, CommandSendReceipt},
+    Payload,
+};
 pub use producer::{MultiTopicProducer, Producer, ProducerOptions};
-pub use message::{Payload, proto::{self, CommandSendReceipt}};
 
 mod client;
 mod connection;
@@ -169,14 +184,15 @@ pub mod error;
 pub mod executor;
 pub mod message;
 pub mod producer;
+pub mod reader;
 mod service_discovery;
 
 #[cfg(test)]
 mod tests {
+    use futures::{future::try_join_all, StreamExt};
+    use log::{LevelFilter, Metadata, Record};
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
-    use log::{LevelFilter, Metadata, Record};
-    use futures::{future::try_join_all, StreamExt};
 
     #[cfg(feature = "tokio-runtime")]
     use tokio::time::timeout;
@@ -185,13 +201,12 @@ mod tests {
     use crate::executor::TokioExecutor;
 
     use crate::client::SerializeMessage;
+    use crate::consumer::{InitialPosition, Message};
+    use crate::message::proto::command_subscribe::SubType;
     use crate::message::Payload;
     use crate::Error as PulsarError;
-    use crate::consumer::Message;
-    use crate::message::proto::command_subscribe::SubType;
 
     use super::*;
-
 
     #[derive(Debug, Serialize, Deserialize)]
     struct TestData {
@@ -324,7 +339,7 @@ mod tests {
             .with_subscription_type(SubType::Exclusive)
             .with_subscription("test_subscription")
             .with_options(ConsumerOptions {
-                initial_position: Some(1),
+                initial_position: InitialPosition::Earliest,
                 ..Default::default()
             })
             .build()
@@ -341,6 +356,7 @@ mod tests {
         let mut received = BTreeSet::new();
         while let Ok(Some(msg)) = timeout(Duration::from_secs(10), consumer.next()).await {
             let msg: Message<TestData> = msg.unwrap();
+            info!("id: {:?}", msg.message_id());
             received.insert(msg.deserialize().unwrap().id);
             consumer.ack(&msg).await.unwrap();
             if received.len() == message_ids.len() {
@@ -379,7 +395,7 @@ mod tests {
                 .with_subscription_type(SubType::Exclusive)
                 .with_subscription("test_subscription")
                 .with_options(ConsumerOptions {
-                    initial_position: Some(1),
+                    initial_position: InitialPosition::Earliest,
                     ..Default::default()
                 })
                 .build::<String>()
@@ -417,7 +433,7 @@ mod tests {
                 .with_subscription_type(SubType::Exclusive)
                 .with_subscription("test_subscription")
                 .with_options(ConsumerOptions {
-                    initial_position: Some(1),
+                    initial_position: InitialPosition::Earliest,
                     ..Default::default()
                 })
                 .build::<Vec<u8>>()
@@ -459,7 +475,7 @@ mod tests {
             .with_topic(topic)
             .with_unacked_message_resend_delay(Some(Duration::from_millis(100)))
             .with_options(ConsumerOptions {
-                initial_position: Some(1),
+                initial_position: InitialPosition::Earliest,
                 ..Default::default()
             })
             .build()
@@ -493,7 +509,8 @@ mod tests {
         let topic = format!("test_batching_{}", rand::random::<u16>());
 
         let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
-        let mut producer = pulsar.producer()
+        let mut producer = pulsar
+            .producer()
             .with_topic(&topic)
             .with_options(ProducerOptions {
                 batch_size: Some(5),
@@ -503,25 +520,29 @@ mod tests {
             .await
             .unwrap();
 
-        let mut consumer: Consumer<String, _> = pulsar
-            .consumer()
-            .with_topic(topic)
-            .build()
-            .await
-            .unwrap();
+        let mut consumer: Consumer<String, _> =
+            pulsar.consumer().with_topic(topic).build().await.unwrap();
 
         let mut send_receipts = Vec::new();
         for i in 0..4 {
             send_receipts.push(producer.send(i.to_string()).await.unwrap());
         }
-        assert!(timeout(Duration::from_millis(100), consumer.next()).await.is_err());
+        assert!(timeout(Duration::from_millis(100), consumer.next())
+            .await
+            .is_err());
 
         send_receipts.push(producer.send(5.to_string()).await.unwrap());
 
-        timeout(Duration::from_millis(100), try_join_all(send_receipts)).await.unwrap().unwrap();
+        timeout(Duration::from_millis(100), try_join_all(send_receipts))
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut count = 0;
-        while let Some(message) = timeout(Duration::from_millis(100), consumer.next()).await.unwrap() {
+        while let Some(message) = timeout(Duration::from_millis(100), consumer.next())
+            .await
+            .unwrap()
+        {
             let message = message.unwrap();
             count += 1;
             let _ = consumer.ack(&message).await;
@@ -536,8 +557,14 @@ mod tests {
             send_receipts.push(producer.send(i.to_string()).await.unwrap());
         }
         producer.send_batch().await.unwrap();
-        timeout(Duration::from_millis(100), try_join_all(send_receipts)).await.unwrap().unwrap();
-        while let Some(message) = timeout(Duration::from_millis(100), consumer.next()).await.unwrap() {
+        timeout(Duration::from_millis(100), try_join_all(send_receipts))
+            .await
+            .unwrap()
+            .unwrap();
+        while let Some(message) = timeout(Duration::from_millis(100), consumer.next())
+            .await
+            .unwrap()
+        {
             let message = message.unwrap();
             count += 1;
             let _ = consumer.ack(&message).await;
