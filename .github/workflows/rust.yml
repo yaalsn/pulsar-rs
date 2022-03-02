@@ -12,8 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      #- name: Start Pulsar
-      #run: docker exec ${{ job.services.pulsar.id }} sh -c 'bin/pulsar standalone'
+    - name: Start Pulsar Standalone Container
+      run: docker create --name pulsar -p 6650:6650 -p 8080:8080 --entrypoint "bin/pulsar standalone" -e GITHUB_ACTIONS=true -e CI=true streamnative/pulsar:2.9.2.5
+
     - uses: actions/checkout@v2
     - name: Build
       run: cargo build --verbose
@@ -36,12 +37,3 @@ jobs:
 
     - name: Run tests
       run: cargo test -- --nocapture
-
-    services:
-      pulsar:
-        image: apachepulsar/pulsar:2.7.0
-        ports:
-          - 6650:6650
-          - 8080:8080
-        options: "--entrypoint bin/pulsar standalone"
-
