@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: [ 'v[0-9]+.*' ]
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: cargo package
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          branch: main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: |
+          sed -i 's/pulsar/sn-pulsar/g' Cargo.toml &&
+          sed -i 's/wyyerd\/sn-pulsar-rs/streamnative\/pulsar-rs/g' Cargo.toml
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  upload-assets:
+    needs: [create-release]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v2
+      - run: |
+          sed -i 's/pulsar/sn-pulsar/g' Cargo.toml &&
+          sed -i 's/wyyerd\/sn-pulsar-rs/streamnative\/pulsar-rs/g' Cargo.toml
+
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: sn-pulsar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
