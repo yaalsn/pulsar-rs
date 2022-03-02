@@ -16,16 +16,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-      - uses: actions-rs/cargo@v1
-        with:
-          use-cross: true
-          command: build
-          args: --release --target=${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }} --release
+
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
