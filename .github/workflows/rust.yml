@@ -13,7 +13,7 @@ jobs:
 
     steps:
     - name: Start Pulsar Standalone Container
-      run: docker run --name pulsar -p 6650:6650 -p 8080:8080 --entrypoint "/pulsar/bin/pulsar standalone" -e GITHUB_ACTIONS=true -e CI=true streamnative/pulsar:2.9.2.5
+      run: docker run --name pulsar -p 6650:6650 -p 8080:8080 -d -e GITHUB_ACTIONS=true -e CI=true streamnative/pulsar:2.9.2.5 /pulsar/bin/pulsar standalone
 
     - uses: actions/checkout@v2
     - name: Build
