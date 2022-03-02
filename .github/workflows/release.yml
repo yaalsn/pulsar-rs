@@ -19,7 +19,7 @@ jobs:
 
       - name: Build
         run: |
-          rustup target add x86_64-apple-darwin &&
+          rustup target add ${{ matrix.target }} &&
           cargo build --target ${{ matrix.target }} --release
 
       - name: Release
